@@ -5,7 +5,8 @@ An ESP32-C6 bridge that lets a Garmin watch use a **Tunturi FitCycle 50i** exerc
 ```
 FitCycle 50i  <── BLE (unencrypted) ──  ESP32-C6  ── BLE (bonded) ──>  Garmin Fenix 8
                                            │
-                                      1.47" LCD: watts, rpm, level, kJ
+                        1.47" LCD: watts, rpm, level, kJ
+                        Wi-Fi setup page (on demand): pairing, live stats, settings
 ```
 
 ## Why a bridge?
@@ -26,6 +27,8 @@ The bridge connects to the bike unencrypted, offers the watch a normal bondable 
 - **Set resistance:** passed straight through.
 - **Self-healing:** if the bike drops or gets stuck in its own ERG mode, the bridge reconnects and restores the level. Distance and time keep counting on the watch.
 - **Status screen:** connection lights, mode, watts as seven-segment digits, rpm, level, plus session and lifetime energy (kJ). The lifetime total persists in flash.
+- **Setup page over Wi-Fi:** pair the bike from your phone, watch live stats and tune the ride feel. The hotspot only runs while needed, so it doesn't add heat or compete with Bluetooth during rides.
+- **Pairs with one bike:** after pairing, the bridge only connects to that bike's address, so it won't grab a neighbour's or a gym's FTMS bike.
 
 ## Hardware
 
@@ -35,32 +38,46 @@ The bridge connects to the bike unencrypted, offers the watch a normal bondable 
 
 ## Build and flash
 
-Requires [PlatformIO](https://platformio.org/) (`pip install platformio`). The ESP32-C6 needs Arduino core 3.x, so the project uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform.
+Requires [PlatformIO](https://platformio.org/) (`pip install platformio`). The ESP32-C6 needs Arduino core 3.x, so the project uses the [pioarduino](https://github.com/pioarduino/platform-espressif32) platform. BLE, Wi-Fi and the web server need more than the default app slot, so the bridge uses the `min_spiffs` partition table (1.9 MB app).
 
 ```sh
 pio run -e bridge -t upload      # the bridge (default)
 pio device monitor               # serial log, 115200 baud
 ```
 
+## First-time setup: pair the bike
+
+On first start (no bike paired yet) the bridge opens its setup hotspot and shows a QR code.
+
+1. **Scan the QR code** with your phone camera to join the Wi-Fi `FitCycle-Bridge-XXXX`, or join it by hand with the password shown on the screen. The password is generated per device, so neighbours can't change your pairing.
+2. The setup page opens by itself (captive portal). If it doesn't, browse to `http://192.168.4.1`.
+3. **Wake the bike console** by pedalling a few strokes, and close the Tunturi app (the bike accepts only one connection).
+4. Tap **Pair** next to your bike under *Nearby bikes*. The **BIKE** light on the screen turns green.
+
+The hotspot closes 3 minutes after the page was last used. **Hold BOOT for 2 seconds** to open or close it at any time.
+
 ## Pairing with the watch
 
-1. Wake the bike console (pedal a few strokes). The bridge finds the bike within a few seconds and the **BIKE** light turns green.
+1. Make sure the **BIKE** light is green (wake the console if it isn't).
 2. On the watch: **Sensors & Accessories → Add New → Search All**, and pick the trainer ("Tunturi Bridge", shown as *Indoor Trainer*).
 3. Start an **Indoor Bike** activity. The **WATCH** light turns green and the mode shows `SIM`, `ERG` or `RES`.
 
-The bike only accepts one connection, so once the bridge is running, the Tunturi app and other apps can't connect to the bike.
+## Setup page
 
-## Tuning
+| Section | What it does |
+|---|---|
+| Live | watts, cadence, level, speed, distance, session and lifetime energy |
+| Bike / Nearby bikes | pair a bike, or **Forget bike** to go back to first-time setup |
+| Watch | connection state, **Forget watch pairing** (then pair the watch again) |
+| Settings | saved in flash, see below; **Reset total energy** |
 
-At the top of the resistance-control section in `src/bridge/main.cpp`:
-
-| Constant | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
-| `SIM_BASE_LEVEL` | 5 | resistance level on a flat road |
-| `SIM_LEVELS_PER_PERCENT` | 2 | extra levels per 1 % of grade |
-| `ERG_HYSTERESIS_LEVELS` | 1.0 | how far off the ideal level must be before changing |
-| `ERG_PERSIST_MS` | 2000 | ...and for how long |
-| `ERG_REVERSE_MS` | 3000 | minimum wait before changing back the other way |
+| Flat road level | 5 | resistance level on a flat road in simulation |
+| Levels per 1 % grade | 2 | extra levels per percent of grade |
+| ERG: change level when off by | 1.0 levels | how far off the ideal level must be before changing... |
+| ERG: for at least | 2.0 s | ...and for how long |
+| Screen brightness | 60 % | full brightness mostly turns into heat in the board's regulator |
 
 ## Protocol notes
 

@@ -12,7 +12,15 @@ struct DisplayState {
   const char* mode;    // already formatted, e.g. "ERG 150W"
   double sessionKj;
   double totalKj;
+
+  // Setup mode: Wi-Fi hotspot with the configuration page.
+  bool setup;
+  const char* ssid;
+  const char* password;
+  const char* url;
+  const char* bikeName;  // paired bike, "" if none
 };
 
 void displayBegin();
+void displaySetBrightness(uint8_t percent);
 void displayDraw(const DisplayState& s);

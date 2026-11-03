@@ -21,6 +21,7 @@
 #include <freertos/queue.h>
 
 #include "display.h"
+#include "portal.h"
 
 static const char* BRIDGE_NAME = "Tunturi Bridge";
 
@@ -269,13 +270,53 @@ static void startPeripheral() {
   Serial.printf("Advertising as '%s'\n", BRIDGE_NAME);
 }
 
+// --- Settings ----------------------------------------------------------------
+// Tunable from the setup page, stored in NVS.
+
+static Preferences prefs;
+
+struct Settings {
+  // Simulation: level on a flat road and extra levels per percent of grade.
+  float simBase = 5;
+  float simPerPercent = 2;
+  // ERG: change level only when the ideal level has been at least this far
+  // off, in the same direction, for this long; then jump straight to it.
+  // Defaults tuned by replaying recorded rides: ~40% fewer changes than a
+  // plain 0.9-level band, at the same average power error.
+  float ergHysteresis = 1.0f;
+  float ergPersistS = 2.0f;
+  float brightness = 60;  // %
+} settings;
+
+static const uint32_t ERG_REVERSE_MS = 3000;  // minimum wait before changing back
+
+static void loadSettings() {
+  settings.simBase = prefs.getFloat("sim_base", settings.simBase);
+  settings.simPerPercent = prefs.getFloat("sim_pct", settings.simPerPercent);
+  settings.ergHysteresis = prefs.getFloat("erg_hyst", settings.ergHysteresis);
+  settings.ergPersistS = prefs.getFloat("erg_persist", settings.ergPersistS);
+  settings.brightness = prefs.getFloat("brightness", settings.brightness);
+}
+
 // --- Central side (towards the bike) ----------------------------------------
 
 static NimBLEClient* bike;
 static NimBLERemoteCharacteristic* bikeControlPoint;
-static uint32_t nextBikeAttemptMs = 0;
 static uint32_t lastBikeDataMs = 0;
 static bool bikeDataGapLogged = false;
+
+// The paired bike. The bridge only ever connects to this address.
+static bool bikePaired = false;
+static NimBLEAddress bikeAddress;
+static String bikeName;
+
+static void loadPairedBike() {
+  if (!prefs.isKey("bike_addr")) return;
+  bikeAddress = NimBLEAddress(std::string(prefs.getString("bike_addr").c_str()), prefs.getUChar("bike_type", 0));
+  bikeName = prefs.getString("bike_name", "");
+  bikePaired = true;
+  Serial.printf("Paired bike: '%s' %s\n", bikeName.c_str(), bikeAddress.toString().c_str());
+}
 
 class BikeCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* c) override { Serial.printf("BIKE connected: %s\n", c->getPeerAddress().toString().c_str()); }
@@ -306,6 +347,65 @@ static bool subscribe(NimBLERemoteService* s, const NimBLEUUID& uuid, bool notif
   return c && c->subscribe(notify, onBikeNotify, true);
 }
 
+// --- Scanning ----------------------------------------------------------------
+// Scans run in the background (the setup page must stay responsive). Every
+// FTMS device seen goes into a small table for the pairing list; seeing the
+// paired bike requests a connection, which loop() then makes.
+
+struct FoundDevice {
+  NimBLEAddress address;
+  char name[32];
+  int rssi;
+  uint32_t seenMs;
+};
+
+static const int MAX_FOUND = 12;
+static FoundDevice found[MAX_FOUND];
+static int foundCount = 0;
+static portMUX_TYPE foundLock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool bikeSeen = false;
+static volatile uint32_t nextScanMs = 0;
+static bool setupActive = false;
+
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* d) override {
+    if (!d->isAdvertisingService(FTMS_SERVICE)) return;
+    std::string name = d->getName();  // allocates, so outside the lock
+    portENTER_CRITICAL(&foundLock);
+    int i = 0;
+    while (i < foundCount && found[i].address != d->getAddress()) i++;
+    if (i == foundCount && foundCount < MAX_FOUND) {
+      foundCount++;
+      found[i].address = d->getAddress();
+      found[i].name[0] = 0;
+    }
+    if (i < foundCount) {
+      // Passive scans carry no name; keep one learned from an active scan.
+      if (!name.empty()) strlcpy(found[i].name, name.c_str(), sizeof(found[i].name));
+      found[i].rssi = d->getRSSI();
+      found[i].seenMs = millis();
+    }
+    portEXIT_CRITICAL(&foundLock);
+
+    if (bikePaired && d->getAddress() == bikeAddress) {
+      bikeSeen = true;
+      NimBLEDevice::getScan()->stop();
+    }
+  }
+  void onScanEnd(const NimBLEScanResults&, int) override { nextScanMs = millis() + (setupActive ? 1000 : 3000); }
+};
+
+static void startScan() {
+  NimBLEScan* sc = NimBLEDevice::getScan();
+  if (sc->isScanning()) return;
+  // In setup, scan actively (to learn bike names for the list). Otherwise a
+  // passive, low-duty scan: a busy scan starves the watch connection.
+  sc->setActiveScan(setupActive);
+  sc->setInterval(setupActive ? 100 : 160);
+  sc->setWindow(30);
+  sc->start(5000, false, true);
+}
+
 // --- Resistance control --------------------------------------------------------
 // The FitCycle's own ERG and simulation modes hunt between resistance levels
 // constantly, and once either is active the bike ignores "set resistance"
@@ -318,17 +418,6 @@ static const char* MODE_NAMES[] = {"free", "resistance", "erg", "sim"};
 
 static const int MIN_LEVEL = 1;
 static const int MAX_LEVEL = 32;
-// Simulation: level on flat road and extra levels per percent of grade.
-static const float SIM_BASE_LEVEL = 5.0f;
-static const float SIM_LEVELS_PER_PERCENT = 2.0f;
-// ERG: change level only when the ideal level has been at least this far off,
-// in the same direction, for this long; then jump straight to it. Reversing
-// direction needs a longer wait. Keeps the resistance motor quiet.
-static const float ERG_HYSTERESIS_LEVELS = 1.0f;
-// Tuned by replaying recorded rides: ~40% fewer changes than a plain 0.9-level
-// band, at the same average power error.
-static const uint32_t ERG_PERSIST_MS = 2000;
-static const uint32_t ERG_REVERSE_MS = 3000;
 
 static Mode mode = MODE_FREE;
 static int targetLevel = 0;       // level the bridge wants (0 = not set)
@@ -342,7 +431,7 @@ static uint32_t ergOffSinceMs = 0;  // when the ideal level started being off
 static int ergOffDirection = 0;     // +1 needs more resistance, -1 less
 static int ergLastDirection = 0;    // direction of the last change
 
-// The bike's reported power, measured at levels 1-15 and 40-90 rpm:
+// The bike's reported power, fitted across all 32 levels at 40-100 rpm:
 //   P = (19.5 + 10 * level) * (rpm / 70) ^ 1.72
 static float modelPower(float level, float rpm) { return (19.5f + 10.0f * level) * powf(rpm / 70.0f, 1.72f); }
 static float levelForPower(float watts, float rpm) { return (watts / powf(rpm / 70.0f, 1.72f) - 19.5f) / 10.0f; }
@@ -365,6 +454,11 @@ static void applyLevel(bool force) {
   }
 }
 
+static void applySimGrade() {
+  targetLevel = clampLevel(settings.simBase + settings.simPerPercent * simGrade);
+  applyLevel(false);
+}
+
 static void updateErg(const BikeData& b) {
   float rpm = b.cadence / 2.0f;
   smoothedRpm = smoothedRpm == 0 ? rpm : smoothedRpm * 0.3f + rpm * 0.7f;
@@ -378,14 +472,14 @@ static void updateErg(const BikeData& b) {
   }
   float ideal = levelForPower(ergTargetW, smoothedRpm) + ergTrim;
   float off = ideal - commandedLevel;
-  int direction = off >= ERG_HYSTERESIS_LEVELS ? 1 : off <= -ERG_HYSTERESIS_LEVELS ? -1 : 0;
+  int direction = off >= settings.ergHysteresis ? 1 : off <= -settings.ergHysteresis ? -1 : 0;
   uint32_t now = millis();
   if (direction == 0 || direction != ergOffDirection) {
     ergOffDirection = direction;
     ergOffSinceMs = now;
     return;
   }
-  bool persisted = now - ergOffSinceMs >= ERG_PERSIST_MS;
+  bool persisted = now - ergOffSinceMs >= settings.ergPersistS * 1000;
   bool reversing = direction != ergLastDirection && now - levelChangedMs < ERG_REVERSE_MS;
   if (persisted && !reversing) {
     targetLevel = clampLevel(ideal);
@@ -431,12 +525,10 @@ static void handleWatchCommand(const uint8_t* d, size_t n) {
       break;
     case 0x11:  // indoor bike simulation: wind, grade (0.01 %), crr, cw
       if (n >= 5) {
-        float grade = i16(3) / 100.0f;
-        simGrade = grade;
+        simGrade = i16(3) / 100.0f;
         mode = MODE_SIM;
-        targetLevel = clampLevel(SIM_BASE_LEVEL + SIM_LEVELS_PER_PERCENT * grade);
-        applyLevel(false);
-        Serial.printf("SIM grade %.2f %%\n", grade);
+        applySimGrade();
+        Serial.printf("SIM grade %.2f %%\n", simGrade);
       } else result = 0x03;
       break;
     default:
@@ -447,23 +539,16 @@ static void handleWatchCommand(const uint8_t* d, size_t n) {
 }
 
 static void connectBike() {
-  Serial.println("Scanning for the bike...");
-  NimBLEScanResults results = NimBLEDevice::getScan()->getResults(5000, false);
-  const NimBLEAdvertisedDevice* target = nullptr;
-  for (int i = 0; i < results.getCount(); i++) {
-    const NimBLEAdvertisedDevice* d = results.getDevice(i);
-    if (d->isAdvertisingService(FTMS_SERVICE) && d->getName() != BRIDGE_NAME) { target = d; break; }
-  }
-  if (!target) { Serial.println("Bike not found (is the console awake?)"); return; }
-
-  Serial.printf("Found '%s' %s\n", target->getName().c_str(), target->getAddress().toString().c_str());
+  NimBLEScan* sc = NimBLEDevice::getScan();
+  sc->stop();  // can't connect while scanning
   if (!bike) {
     bike = NimBLEDevice::createClient();
     bike->setClientCallbacks(new BikeCallbacks(), false);
     bike->setConnectTimeout(10000);
   }
+  Serial.printf("Connecting to '%s' %s\n", bikeName.c_str(), bikeAddress.toString().c_str());
   // Skip our own MTU exchange: the bike starts one itself and the two collide.
-  if (!bike->connect(target->getAddress(), true, false, false) && !bike->isConnected()) {
+  if (!bike->connect(bikeAddress, true, false, false) && !bike->isConnected()) {
     Serial.println("BIKE connect failed");
     return;
   }
@@ -508,7 +593,6 @@ static uint32_t levelMismatchSinceMs = 0;
 static const uint32_t ENERGY_SAVE_MS = 60000;
 static const uint32_t NEW_SESSION_AFTER_MS = 5 * 60000;
 
-static Preferences prefs;
 static double totalJ = 0, sessionJ = 0;
 static double savedTotalJ = 0;
 static uint32_t lastPowerSampleMs = 0, lastEnergySaveMs = 0, bikeDownSinceMs = 0;
@@ -547,6 +631,217 @@ static void trackBikePresence(bool bikeUp) {
   if (now - lastEnergySaveMs >= ENERGY_SAVE_MS) saveEnergy(false);
 }
 
+// --- Setup mode --------------------------------------------------------------
+// A Wi-Fi hotspot with the setup page. Starts on its own while no bike is
+// paired, or when BOOT is held; ends when BOOT is held again, or once a bike is
+// paired and nobody has used the page for a while.
+
+static const int PIN_BOOT = 9;
+static const uint32_t BOOT_HOLD_MS = 2000;
+static const uint32_t SETUP_IDLE_MS = 3 * 60000;
+static const char* SETUP_URL = "http://192.168.4.1";
+
+static char wifiSsid[32];
+static char wifiPassword[16];
+static uint32_t setupStartedMs = 0;
+static uint32_t bootPressedMs = 0;
+static bool bootHandled = false;
+
+static void loadWifiCredentials() {
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(wifiSsid, sizeof(wifiSsid), "FitCycle-Bridge-%02X%02X", (uint8_t)(mac >> 32), (uint8_t)(mac >> 40));
+  // A per-device password, so a neighbour can't change the pairing. No
+  // look-alike characters: it gets typed from the screen.
+  String saved = prefs.getString("wifi_pass", "");
+  if (saved.length() != 8) {
+    const char* chars = "abcdefghjkmnpqrstuvwxyz23456789";
+    saved = "";
+    for (int i = 0; i < 8; i++) saved += chars[esp_random() % strlen(chars)];
+    prefs.putString("wifi_pass", saved);
+  }
+  strlcpy(wifiPassword, saved.c_str(), sizeof(wifiPassword));
+}
+
+static void enterSetup() {
+  if (setupActive) return;
+  setupActive = true;
+  setupStartedMs = millis();
+  NimBLEDevice::getScan()->stop();  // restart as an active scan
+  nextScanMs = 0;
+  portalStart(wifiSsid, wifiPassword);
+}
+
+static void exitSetup() {
+  if (!setupActive) return;
+  setupActive = false;
+  portalStop();
+}
+
+static void handleBootButton() {
+  if (digitalRead(PIN_BOOT) == HIGH) {
+    bootPressedMs = 0;
+    bootHandled = false;
+    return;
+  }
+  if (!bootPressedMs) bootPressedMs = millis();
+  if (!bootHandled && millis() - bootPressedMs >= BOOT_HOLD_MS) {
+    bootHandled = true;
+    if (setupActive) exitSetup();
+    else enterSetup();
+  }
+}
+
+static void checkSetupTimeout() {
+  if (!setupActive || !bikePaired || portalClientCount() > 0) return;
+  uint32_t lastUse = max(setupStartedMs, portalLastRequestMs());
+  if (millis() - lastUse > SETUP_IDLE_MS) {
+    Serial.println("SETUP idle, closing");
+    exitSetup();
+  }
+}
+
+// --- Setup page API (called from portalLoop) ---------------------------------
+
+static String jsonString(const char* s) {
+  String out = "\"";
+  for (; *s; s++) {
+    if (*s == '"' || *s == '\\') out += '\\';
+    if ((uint8_t)*s >= 0x20) out += *s;
+  }
+  return out + "\"";
+}
+
+String bridgeStatusJson() {
+  bool bikeUp = bike && bike->isConnected();
+  char modeText[16];
+  switch (mode) {
+    case MODE_ERG: snprintf(modeText, sizeof(modeText), "ERG %d W", ergTargetW); break;
+    case MODE_SIM: snprintf(modeText, sizeof(modeText), "SIM %.1f %%", simGrade); break;
+    case MODE_RESISTANCE: snprintf(modeText, sizeof(modeText), "Level %d", commandedLevel); break;
+    default: snprintf(modeText, sizeof(modeText), "Free");
+  }
+  char buf[512];
+  snprintf(buf, sizeof(buf),
+           "{\"bike\":{\"paired\":%s,\"name\":%s,\"address\":\"%s\",\"connected\":%s},"
+           "\"watch\":{\"connected\":%s},\"hasData\":%s,\"mode\":\"%s\",\"modeText\":\"%s\","
+           "\"power\":%d,\"rpm\":%.1f,\"level\":%d,\"speed\":%.2f,\"distance\":%lu,"
+           "\"sessionKj\":%.2f,\"totalKj\":%.2f,\"tempC\":%.1f}",
+           bikePaired ? "true" : "false", jsonString(bikeName.c_str()).c_str(),
+           bikePaired ? bikeAddress.toString().c_str() : "", bikeUp ? "true" : "false",
+           server->getConnectedCount() > 0 ? "true" : "false",
+           bikeUp && millis() - lastBikeDataMs < 3000 ? "true" : "false", MODE_NAMES[mode], modeText, latest.power,
+           latest.cadence / 2.0, latest.resistance, latest.speed / 100.0, (unsigned long)latest.distance,
+           sessionJ / 1000, totalJ / 1000, temperatureRead());
+  return buf;
+}
+
+String bridgeDevicesJson() {
+  FoundDevice copy[MAX_FOUND];
+  portENTER_CRITICAL(&foundLock);
+  int n = foundCount;
+  memcpy(copy, found, sizeof(FoundDevice) * n);
+  portEXIT_CRITICAL(&foundLock);
+
+  String out = "{\"scanning\":";
+  out += NimBLEDevice::getScan()->isScanning() ? "true" : "false";
+  out += ",\"devices\":[";
+  bool first = true;
+  for (int i = 0; i < n; i++) {
+    if (millis() - copy[i].seenMs > 60000) continue;  // gone
+    if (!first) out += ',';
+    first = false;
+    out += "{\"address\":\"" + String(copy[i].address.toString().c_str()) + "\",\"name\":" + jsonString(copy[i].name) +
+           ",\"rssi\":" + copy[i].rssi + ",\"paired\":" +
+           (bikePaired && copy[i].address == bikeAddress ? "true" : "false") + "}";
+  }
+  return out + "]}";
+}
+
+String bridgeSettingsJson() {
+  char buf[200];
+  snprintf(buf, sizeof(buf),
+           "{\"simBase\":%.0f,\"simPerPercent\":%.1f,\"ergHysteresis\":%.1f,\"ergPersist\":%.1f,\"brightness\":%.0f}",
+           settings.simBase, settings.simPerPercent, settings.ergHysteresis, settings.ergPersistS, settings.brightness);
+  return buf;
+}
+
+void bridgeStartScan() {
+  portENTER_CRITICAL(&foundLock);
+  foundCount = 0;
+  portEXIT_CRITICAL(&foundLock);
+  NimBLEDevice::getScan()->stop();
+  nextScanMs = 0;
+}
+
+bool bridgePair(const String& address) {
+  portENTER_CRITICAL(&foundLock);
+  int i = 0;
+  while (i < foundCount && String(found[i].address.toString().c_str()) != address) i++;
+  bool ok = i < foundCount;
+  FoundDevice device;
+  if (ok) device = found[i];
+  portEXIT_CRITICAL(&foundLock);
+  if (!ok) return false;
+
+  if (bike && bike->isConnected() && bike->getPeerAddress() != device.address) bike->disconnect();
+  bikeAddress = device.address;
+  bikeName = device.name;
+  bikePaired = true;
+  prefs.putString("bike_addr", bikeAddress.toString().c_str());
+  prefs.putUChar("bike_type", bikeAddress.getType());
+  prefs.putString("bike_name", bikeName);
+  Serial.printf("PAIRED with '%s' %s\n", bikeName.c_str(), bikeAddress.toString().c_str());
+  nextScanMs = 0;
+  return true;
+}
+
+void bridgeForgetBike() {
+  bikePaired = false;
+  bikeName = "";
+  prefs.remove("bike_addr");
+  prefs.remove("bike_type");
+  prefs.remove("bike_name");
+  if (bike && bike->isConnected()) bike->disconnect();
+  Serial.println("Bike forgotten");
+}
+
+void bridgeForgetWatch() {
+  for (uint16_t handle : server->getPeerDevices()) server->disconnect(handle);
+  NimBLEDevice::deleteAllBonds();
+  Serial.println("Watch bonds deleted");
+}
+
+bool bridgeSetSetting(const String& key, float value) {
+  if (key == "simBase") {
+    settings.simBase = constrain(value, 1, 32);
+    prefs.putFloat("sim_base", settings.simBase);
+  } else if (key == "simPerPercent") {
+    settings.simPerPercent = constrain(value, 0, 10);
+    prefs.putFloat("sim_pct", settings.simPerPercent);
+  } else if (key == "ergHysteresis") {
+    settings.ergHysteresis = constrain(value, 0.3f, 5);
+    prefs.putFloat("erg_hyst", settings.ergHysteresis);
+  } else if (key == "ergPersist") {
+    settings.ergPersistS = constrain(value, 0, 30);
+    prefs.putFloat("erg_persist", settings.ergPersistS);
+  } else if (key == "brightness") {
+    settings.brightness = constrain(value, 0, 100);
+    prefs.putFloat("brightness", settings.brightness);
+    displaySetBrightness(settings.brightness);
+  } else {
+    return false;
+  }
+  Serial.printf("SETTING %s = %.2f\n", key.c_str(), value);
+  if (mode == MODE_SIM) applySimGrade();  // feel the new values right away
+  return true;
+}
+
+void bridgeResetTotalEnergy() {
+  totalJ = savedTotalJ = 0;
+  prefs.putULong64("total_j", 0);
+  Serial.println("ENERGY total reset");
+}
+
 // --- Screen --------------------------------------------------------------------
 
 static uint32_t lastDrawMs = 0;
@@ -569,6 +864,11 @@ static void updateDisplay(bool bikeUp) {
   s.mode = modeText;
   s.sessionKj = sessionJ / 1000;
   s.totalKj = totalJ / 1000;
+  s.setup = setupActive;
+  s.ssid = wifiSsid;
+  s.password = wifiPassword;
+  s.url = SETUP_URL;
+  s.bikeName = bikePaired ? (bikeName.length() ? bikeName.c_str() : "Paired bike") : "";
   displayDraw(s);
 }
 
@@ -630,11 +930,17 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\nTunturi FitCycle -> Garmin bridge");
+  setCpuFrequencyMhz(80);  // plenty for BLE, Wi-Fi and the screen; runs cooler than 160
+  pinMode(PIN_BOOT, INPUT_PULLUP);
 
   prefs.begin("tunturi");
+  loadSettings();
+  loadPairedBike();
+  loadWifiCredentials();
   totalJ = savedTotalJ = prefs.getULong64("total_j", 0);
   Serial.printf("ENERGY lifetime total %.1f kJ\n", totalJ / 1000);
   displayBegin();
+  displaySetBrightness(settings.brightness);
   updateDisplay(false);
 
   queue = xQueueCreate(32, sizeof(Msg));
@@ -644,45 +950,53 @@ void setup() {
   // Let the watch bond with us (Just Works); the bike itself refuses pairing.
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-
-  // Passive, low-duty scan: the bike's FTMS UUID is in its advertisement, so
-  // no scan response is needed, and a busy scan starves the watch connection.
-  NimBLEScan* sc = NimBLEDevice::getScan();
-  sc->setActiveScan(false);
-  sc->setInterval(160);
-  sc->setWindow(30);
+  NimBLEDevice::getScan()->setScanCallbacks(new ScanCallbacks(), false);
 
   startPeripheral();
+  if (!bikePaired) enterSetup();
 }
 
 void loop() {
   Msg m;
   while (xQueueReceive(queue, &m, 0) == pdTRUE) handle(m);
+  portalLoop();
+  handleBootButton();
+  checkSetupTimeout();
 
   uint32_t now = millis();
-  if (bike && bike->isConnected() && !bikeDataGapLogged && lastBikeDataMs && now - lastBikeDataMs > 1500) {
+  bool bikeUp = bike && bike->isConnected();
+  if (bikeUp && !bikeDataGapLogged && lastBikeDataMs && now - lastBikeDataMs > 1500) {
     Serial.printf("BIKE data gap: nothing for %lu ms (link still up)\n", now - lastBikeDataMs);
     bikeDataGapLogged = true;
   }
 
-  bool bikeUp = bike && bike->isConnected();
+  if (!bikeUp && bikeSeen) {
+    bikeSeen = false;
+    connectBike();
+    bikeUp = bike && bike->isConnected();
+    nextScanMs = millis() + 3000;
+  }
+  // Scan while looking for the paired bike, and for the pairing list while
+  // someone has the setup page open. Wi-Fi plus nonstop scanning runs hot.
+  bool pageOpen = setupActive && now - portalLastRequestMs() < 30000;
+  if (((bikePaired && !bikeUp) || pageOpen) && now >= nextScanMs) startScan();
+
   trackBikePresence(bikeUp);
   if (now - lastDrawMs >= 250) {
     lastDrawMs = now;
     updateDisplay(bikeUp);
   }
 
-  if (!bikeUp && now >= nextBikeAttemptMs) {
-    connectBike();  // blocks for the 5 s scan
-    nextBikeAttemptMs = millis() + 3000;
-  }
-
   if (now - lastStatusMs >= 5000) {
     lastStatusMs = now;
-    Serial.printf("STATUS bike=%s watch=%u mode=%s level=%d | %d W  %.1f rpm  %.2f km/h  res %d  %lu m",
-                  bike && bike->isConnected() ? "up" : "down", server->getConnectedCount(), MODE_NAMES[mode],
-                  commandedLevel, latest.power, latest.cadence / 2.0, latest.speed / 100.0, latest.resistance,
-                  (unsigned long)latest.distance);
+    // Uptime and reset reason (1 power-on, 3 software, 4 panic, 5-7 watchdog,
+    // 9 brownout) show whether a dropped USB link was a reboot.
+    Serial.printf("STATUS up %lus rst %d %.1fC heap %lu bike=%s watch=%u setup=%d mode=%s level=%d | %d W  %.1f rpm  "
+                  "res %d  %lu m",
+                  now / 1000, (int)esp_reset_reason(), temperatureRead(), (unsigned long)ESP.getFreeHeap(),
+                  bikeUp ? "up" : "down",
+                  server->getConnectedCount(), setupActive, MODE_NAMES[mode], commandedLevel, latest.power,
+                  latest.cadence / 2.0, latest.resistance, (unsigned long)latest.distance);
     if (mode == MODE_ERG)
       Serial.printf("  erg %d W (model %.0f W, trim %.1f)", ergTargetW,
                     modelPower(commandedLevel, smoothedRpm), ergTrim);
